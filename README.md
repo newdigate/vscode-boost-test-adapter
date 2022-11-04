@@ -6,7 +6,9 @@
 * ```run``` or ```debug``` boost tests 
   * from ```Test Explorer``` 
   * from inside test source code
-* Updated 2.0.17 (29 June 2021)
+* Updated 2.0.20 (29 Jan 2022)
+  * cancel running test
+* Updated 2.0.19 (29 June 2021)
   * update configuration reloading
   * added ```boost-test-adapter.cwd``` config to specify current working directory to run test executable from
   * allow ```${parameters}``` in config settings
@@ -18,4 +20,3 @@ point `boost-test-adapter.testExecutable` to  to the path of your boost test exe
 
 ## Features that not implemented yet
 - When debugging a test, the red/green status of the test is not updated in the test explorer
-- Cancel the test.

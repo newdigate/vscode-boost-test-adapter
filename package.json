@@ -1,6 +1,6 @@
 {
   "name": "boost-test-adapter-debug",
-  "version": "2.0.18",
+  "version": "2.0.20",
   "displayName": "Boost.Test Explorer with debug",
   "description": "Run or debug your Boost.Test tests in the Sidebar of Visual Studio Code",
   "author": "Nic Newdigate<nicnewdigate@gmail.com>",

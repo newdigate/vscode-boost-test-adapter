@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import { spawn, ChildProcess } from 'child_process';
 import parseDot = require('dotparser');
 import { Graph, Node } from 'dotparser';
 import { resolve } from 'path';
@@ -43,8 +43,11 @@ export class TestExecutable {
 		readonly workspaceFolder: WorkspaceFolder,
 		readonly path: string,
 		readonly cwd?: string,
-		readonly sourcePrefix?: string) {
+		readonly sourcePrefix?: string,
+		) {
 	}
+
+	private _process?: ChildProcess;
 
 	async listTest(): Promise<TestSuiteInfo> {
 		// gather all output
@@ -210,26 +213,33 @@ export class TestExecutable {
 
 	private run(args: string[]): TestSession {
 		const path = resolve(this.workspaceFolder.uri.fsPath, this.path);
-		const process = spawn(path, ['-x', 'no'].concat(args), { cwd: this.cwd });
+		this._process = spawn(path, ['-x', 'no'].concat(args), { cwd: this.cwd });
 		let stdout, stderr: ReadLine | undefined;
 
 		try {
 			const stopped = new Promise<number>((resolve, reject) => {
-				process.on('error', reject);
-				process.on('close', resolve);
+                this._process?.on('error', (err) => { this._process = undefined; reject(err); });
+                this._process?.on('close', (code) => { this._process = undefined; resolve(code); });
 			});
 
-			stdout = createInterface({ input: process.stdout! });
-			stderr = createInterface({ input: process.stderr! });
+			stdout = createInterface({ input: this._process?.stdout! });
+			stderr = createInterface({ input: this._process?.stderr! });
 
 			return { stdout, stderr, stopped };
 		} catch (e) {
 			stdout?.close();
 			stderr?.close();
-			process.kill();
+            this._process?.kill();
+            this._process = undefined;
 			throw e;
 		}
 	}
+
+	async stop() {
+        if (this._process) {
+            this._process.kill();
+        }
+    }
 
 	private parseSuite(node: Node): TestSuiteInfo {
 		const info = parseLabel(node);
