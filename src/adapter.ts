@@ -1,249 +1,302 @@
 import { Mutex } from 'async-mutex';
-import { access, constants } from 'fs';
-import { resolve } from 'path';
 import * as vscode from "vscode";
 import { Event, EventEmitter, FileSystemWatcher, RelativePattern, workspace, WorkspaceFolder, Uri } from 'vscode';
 import {
-	TestAdapter,
-	TestEvent,
-	TestLoadFinishedEvent,
-	TestLoadStartedEvent,
-	TestRunFinishedEvent,
-	TestRunStartedEvent,
-	TestSuiteEvent,
-	TestSuiteInfo
+    TestAdapter,
+    TestEvent,
+    TestLoadFinishedEvent,
+    TestLoadStartedEvent,
+    TestRunFinishedEvent,
+    TestRunStartedEvent,
+    TestSuiteEvent,
+    TestSuiteInfo
 } from 'vscode-test-adapter-api';
-import { Log } from 'vscode-test-adapter-util';
-import { BinaryError, TestExecutable } from './test-executable';
-var path = require('path');
+import * as logger from './logger';
+import { TestExecutable } from './test-executable';
+import * as config from './config';
+
 export class BoostTestAdapter implements TestAdapter {
-	private readonly mutex: Mutex;
-	private readonly disposables: { dispose(): void }[];
-	private readonly testsEmitter: EventEmitter<TestLoadStartedEvent | TestLoadFinishedEvent>;
-	private readonly testStatesEmitter: EventEmitter<TestRunStartedEvent | TestRunFinishedEvent | TestSuiteEvent | TestEvent>;
-	private testExecutable?: TestExecutable;
-	private watcher?: FileSystemWatcher;
-	private currentTests?: TestSuiteInfo;
+    private readonly rootTestId = "R##T";
+    private readonly mutex: Mutex = new Mutex();
+    private readonly disposables: { dispose(): void }[] = [];
+    private readonly testsEmitter: EventEmitter<TestLoadStartedEvent | TestLoadFinishedEvent>;
+    private readonly testStatesEmitter: EventEmitter<TestRunStartedEvent | TestRunFinishedEvent | TestSuiteEvent | TestEvent>;
+    private testExecutables: Map<string, TestExecutable> = new Map();
+    private watchers: Map<string, FileSystemWatcher> = new Map();
+    private currentTests: Map<string, TestSuiteInfo> = new Map();
 
-	constructor(readonly workspaceFolder: WorkspaceFolder, private readonly log: Log) {
+    constructor(
+        readonly workspaceFolder: WorkspaceFolder,
+        private readonly log: logger.MyLogger) {
 
+        log.info("Initializing adapter.");
+        vscode.workspace.onDidChangeConfiguration(async event => {
+            if (event.affectsConfiguration(config.BoosTestAdapterConfig)) {
+                try {
+                    this.log.info("Configuration changed. Reloading tests.")
+                    await this.reload();
+                } catch (err) {
+                    console.warn(err)
+                }
+            }
+        });
 
-		vscode.workspace.onDidChangeConfiguration(event => {
-			if (event.affectsConfiguration('boost-test-adapter')) {
-				try {
-					this.watcher = undefined;
-					this.updateSettings();
-					this.load();
-				} catch (err) {
-					console.warn(err)
-				}
-			}
-		});
+        this.testsEmitter = new EventEmitter<TestLoadStartedEvent | TestLoadFinishedEvent>();
+        this.testStatesEmitter = new EventEmitter<TestRunStartedEvent | TestRunFinishedEvent | TestSuiteEvent | TestEvent>();
 
-		this.updateSettings();
-		this.mutex = new Mutex();
-		this.disposables = [];
-		this.testsEmitter = new EventEmitter<TestLoadStartedEvent | TestLoadFinishedEvent>();
-		this.testStatesEmitter = new EventEmitter<TestRunStartedEvent | TestRunFinishedEvent | TestSuiteEvent | TestEvent>();
+        this.disposables.push(this.testsEmitter);
+        this.disposables.push(this.testStatesEmitter);
+    }
 
+    async reload(): Promise<void> {
+        await this.updateSettings();
+        await this.load();
+    }
 
-		this.disposables.push(this.testsEmitter);
-		this.disposables.push(this.testStatesEmitter);
-	}
+    private async updateSettings(): Promise<void> {
+        const release = await this.mutex.acquire();
+        try {
+            await this.updateSettingsUnlocked();
+        } finally {
+            release();
+        }
+    }
 
-	updateSettings(): void {
+    private async updateSettingsUnlocked(): Promise<void> {
+        this.clearWatchers();
+        this.currentTests.clear();
+        this.testExecutables.clear();
+        //this.testsEmitter.fire({ type: 'started' });
+        //this.testsEmitter.fire({ type: 'finished', suite: this.createRootTestSuiteInfo() });
 
-		const settings = workspace.getConfiguration('boost-test-adapter');
+        const cfg = await config.getConfig(this.workspaceFolder, this.log);
 
-		const executable = this.detokenizeVariables(settings.get<string>('testExecutable'));
-		this.log.info(`test executable: ${executable}`)
+        for (const cfgTestExe of cfg.testExes) {
+            const testExeId = this.createTestExeId(cfgTestExe.path);
+            this.testExecutables.set(testExeId, new TestExecutable(
+                testExeId,
+                this.workspaceFolder,
+                cfgTestExe,
+                this.log));
+        }
+    }
 
-		const sourcePrefix = this.detokenizeVariables(settings.get<string>('sourcePrefix'));
-		this.log.info(`sourcePrefix: ${sourcePrefix}`)
+    get tests(): Event<TestLoadStartedEvent | TestLoadFinishedEvent> {
+        return this.testsEmitter.event;
+    }
 
-		const cwd = this.detokenizeVariables(settings.get<string>('cwd'));
-		this.log.info(`test executable current working directory: ${cwd}`)
+    get testStates(): Event<TestRunStartedEvent | TestRunFinishedEvent | TestSuiteEvent | TestEvent> {
+        return this.testStatesEmitter.event;
+    }
 
-		this.log.info(`executable = '${executable}', sourcePrefix = '${sourcePrefix}', cwd='${cwd}'`)
+    dispose() {
+        this.cancel();
+        this.clearWatchers();
+        for (const disposable of this.disposables) {
+            disposable.dispose();
+        }
+        this.disposables.length = 0;
+    }
 
-		this.testExecutable = executable
-			? new TestExecutable(
-				this.workspaceFolder,
-				executable,
-				cwd,
-				sourcePrefix ? resolve(this.workspaceFolder.uri.fsPath, sourcePrefix) : undefined)
-			: undefined;
-		this.load();
-	}
+    async load(): Promise<void> {
+        const release = await this.mutex.acquire();
+        try {
+            await this.loadUnlocked();
+        } finally {
+            release();
+        }
+    }
 
-	get tests(): Event<TestLoadStartedEvent | TestLoadFinishedEvent> {
-		return this.testsEmitter.event;
-	}
+    async run(tests: string[]): Promise<void> {
+        const release = await this.mutex.acquire();
+        try {
+            await this.runUnlocked(tests);
+        } finally {
+            release();
+        }
+    }
 
-	get testStates(): Event<TestRunStartedEvent | TestRunFinishedEvent | TestSuiteEvent | TestEvent> {
-		return this.testStatesEmitter.event;
-	}
+    async debug(tests: string[]): Promise<void> {
+        const release = await this.mutex.acquire();
+        try {
+            await this.debugUnlocked(tests);
+        } finally {
+            release();
+        }
+    }
 
-	dispose() {
-		this.cancel();
+    cancel() {
+        for (const [_, testExecutable] of this.testExecutables) {
+            testExecutable.cancelTests(this.log);
+        }
+    }
 
-		for (const disposable of this.disposables) {
-			disposable.dispose();
-		}
+    private async loadUnlocked(): Promise<void> {
+        this.clearWatchers();
+        this.currentTests.clear();
 
-		this.disposables.length = 0;
-	}
+        if (this.testExecutables.size === 0) {
+            await this.updateSettingsUnlocked();
+            if (this.testExecutables.size === 0) {
+                this.log.info('No valid test executables found. Cannot load tests.');
+                this.testsEmitter.fire({ type: 'started' });
+                this.testsEmitter.fire({ type: 'finished', suite: this.createRootTestSuiteInfo() });
+                return;
+            }
+        }
 
-	async load(): Promise<void> {
-		if (!this.testExecutable) {
-			this.log.info('No test executable is provided in the configuration');
-			return;
-		}
+        for (const [_, testExecutable] of this.testExecutables) {
+            await this.loadOneUnlocked(testExecutable)
+        }
+    }
 
-		// load test cases
-		const release = await this.mutex.acquire();
+    private async runUnlocked(tests: string[]): Promise<void> {
+        const testIds = this.resolveRootTestId(tests);
+        const m = this.groupTestIdsByTestExeId(testIds);
+        this.testStatesEmitter.fire({ type: 'started', tests });
+        for (const [testExeId, testIds] of m) {
+            try {
+                await this.testExecutables.get(testExeId)!.runTests(
+                    testIds,
+                    e => this.testStatesEmitter.fire(e));
+            } catch (e) {
+                this.log.exception(e, true);
+            }
+        }
+        this.testStatesEmitter.fire({ type: 'finished' });
+    }
 
-		try {
-			this.testsEmitter.fire({type: 'started'});
-
-			try {
-				this.currentTests = await this.testExecutable.listTest();
-			} catch (e) {
-				if (!(e instanceof BinaryError && e.cause.code === 'ENOENT')) {
-					this.log.error(e);
-				}
-
-				this.currentTests = undefined;
-			}
-
-			this.testsEmitter.fire({type: 'finished', suite: this.currentTests});
-		} finally {
-			release();
-		}
-
-		// start watching test binary
-		if (!this.watcher) {
-			this.watcher = workspace.createFileSystemWatcher(
-				new RelativePattern(this.workspaceFolder, this.testExecutable.path));
-
-			try {
-				const load = (e: Uri) => {
-					return new Promise<void>((resolve, reject) => access(e.fsPath, constants.X_OK, async (e: any) => {
-						if (!e) {
-							try {
-								await this.load();
-							} catch (e) {
-								reject(e);
-								return;
-							}
-						}
-						resolve();
-					}));
-				};
-
-				this.watcher.onDidChange(load);
-				this.watcher.onDidCreate(load);
-				this.watcher.onDidDelete(() => this.load());
-
-				this.disposables.push(this.watcher);
-			} catch (e) {
-				this.log.error(e);
-				this.watcher.dispose();
-			}
-		}
-	}
-
-	async run(tests: string[]): Promise<void> {
-		const all = tests.length === 1 && tests[0] === this.currentTests!.id;
-
-		const release = await this.mutex.acquire();
-
-		try {
-			this.testStatesEmitter.fire({type: 'started', tests});
-
-			try {
-				await this.testExecutable!.runTests(all ? undefined : tests, e => {
-					this.testStatesEmitter.fire(e);
-				}, this.log);
-			} catch (e) {
-				this.log.error(e);
-			}
-
-			this.testStatesEmitter.fire({type: 'finished'});
-		} finally {
-			release();
-		}
-	}
-
-	async debug?(tests: string[]): Promise<void> {
-		let args: String[] = [];
-		const ids = tests.join(',');
-		if (ids) {
-			args = [`--run_test=${ids}`];
-		}
-		const path = resolve(this.workspaceFolder.uri.fsPath, this.testExecutable!.path);
-		const debugConfiguration: vscode.DebugConfiguration = {
-			name: "(lldb) Launch test cmake",
-			type: "cppdbg",
-			request: "launch",
-			cwd: this.testExecutable?.cwd,
-			program: path,
-			linux: {
-				MIMode: "gdb",
-			},
-			osx: {
-				MIMode: "lldb"
-			},
-			windows: {
-				MIMode: "gdb",
-			},
-			args: args,
-			outputCapture: "std"
-		};
-		this.log.info(`${JSON.stringify(debugConfiguration)} workspaceFolder=${this.testExecutable?.workspaceFolder.uri.fsPath} cwd=${this.testExecutable?.cwd}`)
-		await vscode.debug.startDebugging(undefined, debugConfiguration);
-	}
-
-	cancel() {
-        if (!this.testExecutable) {
-            this.log.info('No test executable is provided in the configuration');
+    private async debugUnlocked(tests: string[]): Promise<void> {
+        const testIds = this.resolveRootTestId(tests);
+        const m = this.groupTestIdsByTestExeId(testIds);
+        if (m.size > 1) {
+            this.log.error("Cannot debug multiple test executables at once", true);
             return;
         }
-        this.testExecutable.stop();
-	}
 
-	// detokenizeVariables is based on https://github.com/DominicVonk/vscode-variables
-	detokenizeVariables(rawValue: string | undefined, recursive = false): string | undefined {
-		if (rawValue == undefined) {
-			return undefined;
-		}
+        const testExeId = this.getTestExeId(testIds[0]);
+        const testExecutable = this.testExecutables.get(testExeId)!;
+        await testExecutable.debugTests(tests, this.log);
+    }
 
-		let workspaces = vscode.workspace.workspaceFolders;
-		let workspace = vscode.workspace.workspaceFolders?.length ? vscode.workspace.workspaceFolders[0] : null;
-		let activeFile = vscode.window.activeTextEditor?.document;
-		let absoluteFilePath = activeFile?.uri.fsPath
-		rawValue = rawValue?.replace(/\${workspaceFolder}/g, workspace?.uri.fsPath ?? "");
-		rawValue = rawValue?.replace(/\${workspaceFolderBasename}/g, workspace?.name ?? "");
-		rawValue = rawValue?.replace(/\${file}/g, absoluteFilePath ?? "");
-		let activeWorkspace = workspace;
-		let relativeFilePath = absoluteFilePath;
-		for (let workspace of workspaces ?? []) {
-			if (absoluteFilePath?.replace(workspace.uri.fsPath, '') !== absoluteFilePath) {
-				activeWorkspace = workspace;
-				relativeFilePath = absoluteFilePath?.replace(workspace.uri.fsPath, '').substr(path.sep.length);
-				break;
-			}
-		}
-		rawValue = rawValue?.replace(/\${fileWorkspaceFolder}/g, activeWorkspace?.uri.fsPath ?? "");
-		rawValue = rawValue?.replace(/\${relativeFile}/g, relativeFilePath ?? "");
-		rawValue = rawValue?.replace(/\${relativeFileDirname}/g, relativeFilePath?.substr(0, relativeFilePath.lastIndexOf(path.sep)) ?? "");
-		let parsedPath = absoluteFilePath ? path.parse(absoluteFilePath) : undefined;
-		rawValue = rawValue?.replace(/\${fileBasename}/g, parsedPath?.base ?? "");
-		rawValue = rawValue?.replace(/\${fileBasenameNoExtension}/g, parsedPath?.name ?? "");
-		rawValue = rawValue?.replace(/\${fileExtname}/g, parsedPath?.ext ?? "");
-		rawValue = rawValue?.replace(/\${fileDirname}/g, parsedPath?.dir?.substr(parsedPath?.dir?.lastIndexOf(path.sep) + 1) ?? "");
-		rawValue = rawValue?.replace(/\${cwd}/g, parsedPath?.dir ?? "");
-		rawValue = rawValue?.replace(/\${pathSeparator}/g, path.sep);
-		return rawValue;
-	}
+    private async loadOne(testExecutable: TestExecutable): Promise<void> {
+        const release = await this.mutex.acquire();
+        try {
+            await this.loadOneUnlocked(testExecutable);
+        } finally {
+            release();
+        }
+    }
+
+    private async loadOneUnlocked(testExecutable: TestExecutable): Promise<void> {
+        const key = testExecutable.id;
+
+        this.testsEmitter.fire({ type: 'started' });
+        try {
+            this.currentTests.set(key, await testExecutable.listTest());
+        } catch (e) {
+            this.log.exception(e);
+
+            this.currentTests.set(key, <TestSuiteInfo>{
+                type: 'suite',
+                id: testExecutable.cfg.path,
+                label: testExecutable.cfg.path,
+                file: testExecutable.cfg.path,
+                line: undefined,
+                children: []
+            });
+        }
+        this.testsEmitter.fire({ type: 'finished', suite: this.createRootTestSuiteInfo() });
+
+        // start watching test binary
+        if (!this.watchers.has(key)) {
+            const watcher = workspace.createFileSystemWatcher(
+                new RelativePattern(this.workspaceFolder, testExecutable.cfg.path));
+
+            try {
+                const load = async (e: Uri) => {
+                    this.log.info(`Test executable has changed: ${testExecutable.cfg.path}`);
+                    if (e.fsPath !== testExecutable.absPath) {
+                        this.log.warn(`Paths don't match: ${e.fsPath} should be ${testExecutable.absPath}`);
+                        return;
+                    }
+                    try {
+                        await this.loadOne(testExecutable);
+                    } catch (e) {
+                        this.log.exception(e);
+                    }
+                };
+
+                watcher.onDidChange(load);
+                watcher.onDidCreate(load);
+                watcher.onDidDelete(load);
+                this.watchers.set(key, watcher);
+            } catch (e) {
+                this.log.exception(e);
+                watcher.dispose();
+            }
+        }
+    }
+
+    private clearWatchers() {
+        for (const [_, watcher] of this.watchers) {
+            watcher.dispose();
+        }
+        this.watchers.clear();
+    }
+
+    private createRootTestSuiteInfo(): TestSuiteInfo {
+        const testsRoot = <TestSuiteInfo>{
+            type: 'suite',
+            id: this.rootTestId,
+            label: "ROOT",
+            children: []
+        };
+        for (const [_, testSuiteInfo] of this.currentTests) {
+            testsRoot.children.push(testSuiteInfo);
+        }
+        return testsRoot;
+    }
+
+    private createTestExeId(testExePath: string): string {
+        const regex = /[\\/]/g;
+        return testExePath.replace(regex, '_');
+    }
+
+    private getTestExeId(testId: string): string {
+        return testId.split('/')[0];
+    }
+
+    // If the root test ID is present among the test IDs then
+    // include all of the test-exe-ids into the list.
+    // I.e. we want to include every test executable.
+    private resolveRootTestId(testIds: string[]): string[] {
+        const resolvedIds: string[] = [];
+        for (const testId of testIds) {
+            if (testId === this.rootTestId) {
+                for (const [testExeId, _] of this.testExecutables) {
+                    resolvedIds.push(testExeId);
+                }
+            } else {
+                resolvedIds.push(testId);
+            }
+        }
+        return resolvedIds;
+    }
+
+    // Groups the test IDs by their test-exe-id component.
+    // The test IDs have this format:
+    // "test-exe-id/suite-1/suite-2/.../test-case"
+    private groupTestIdsByTestExeId(testIds: string[]): Map<string, string[]> {
+        const m: Map<string, string[]> = new Map();
+        for (const testId of testIds) {
+            const testExeId = this.getTestExeId(testId);
+            if (m.has(testExeId)) {
+                m.get(testExeId)!.push(testId);
+            } else {
+                m.set(testExeId, [testId]);
+            }
+        }
+        return m;
+    }
 }

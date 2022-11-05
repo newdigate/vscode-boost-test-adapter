@@ -24,7 +24,13 @@ declare module 'dotparser' {
 	export declare interface Graph {
 		type: 'digraph' | 'graph' | 'subgraph';
 		id?: string;
-		children: Array<Attribute | Node | Graph>;
+		children: Array<Attribute | Node | Graph | Edge>;
+	}
+
+	export declare interface Edge {
+		type: 'edge_stmt';
+		edge_list: NodeId[];
+		attr_list: Value[];
 	}
 
 	declare function parse(s: string): Graph[];
