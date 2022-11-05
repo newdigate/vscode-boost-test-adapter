@@ -5,8 +5,8 @@ using the [Test Explorer UI](https://marketplace.visualstudio.com/items?itemName
 ![debugger](https://github.com/newdigate/vscode-boost-test-adapter/raw/master/debug.gif)
 
 This extension is based on code from these extensions:
-- https://github.com/firoorg/vscode-boost-test-adapter
-- https://github.com/newdigate/vscode-boost-test-adapter.git
+- [firoorg/vscode-boost-test-adapter](https://github.com/firoorg/vscode-boost-test-adapter)
+- [feher/vscode-boost-test-adapter](https://github.com/feher/vscode-boost-test-adapter)
 
 ## Features
 * Tests will appear in the [Test Explorer UI](https://marketplace.visualstudio.com/items?itemName=hbenl.vscode-test-explorer)
